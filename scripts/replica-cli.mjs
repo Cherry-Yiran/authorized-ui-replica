@@ -31,6 +31,8 @@ const MIRROR_RUNTIME_ASSET_PREFIXES = [
   "integrations/",
 ];
 const MIRROR_TEXT_RESOURCE_TYPES = new Set(["document", "script", "stylesheet"]);
+const MIRROR_STATIC_ASSET_EXTENSION_PATTERN =
+  /\.(?:png|jpe?g|gif|svg|webp|avif|ico|woff2?|ttf|otf|mp4|webm|mp3|wav|lottie|wasm)(?:[?#].*)?$/i;
 
 const STYLE_PROPS = [
   "display",
@@ -280,8 +282,9 @@ async function mirrorCommand(positional, options) {
   await downloadHtmlReferencedMirrorAssets(`${pageHtml}\n${mirrorState.hydratedHtml || ""}`, mirrorState);
   await downloadRuntimeDiscoveredMirrorAssets(`${pageHtml}\n${mirrorState.hydratedHtml || ""}`, mirrorState);
   await downloadCssReferencedMirrorAssets(mirrorState);
-  const entries = normalizedMirrorEntries(mirrorState).sort((a, b) => a.url.localeCompare(b.url));
-  const urlMap = Object.fromEntries(entries.filter((entry) => entry.localPath).map((entry) => [entry.url, entry.localPath]));
+  let entries = normalizedMirrorEntries(mirrorState).sort((a, b) => a.url.localeCompare(b.url));
+  entries = await ensureMirrorEntryFiles(entries, mirrorState);
+  const urlMap = buildMirrorUrlMap(entries);
   await rewriteSavedCssAssets(entries, urlMap, sourceUrl, outDir);
   await rewriteSavedScriptReferences(entries, urlMap, sourceUrl, outDir);
 
@@ -870,6 +873,7 @@ async function downloadMirrorAssetUrl(url, state, reason) {
 
   const bodyResult = await fetchMirrorAsset(url).catch(() => null);
   if (!bodyResult) return null;
+  if (!isUsableMirrorAssetResponse(url, bodyResult.mimeType)) return null;
 
   const resourceType = inferResourceType(url, bodyResult.mimeType);
   const entry =
@@ -917,6 +921,7 @@ function extractMirrorAssetUrls(html, sourceUrl) {
   const urls = new Set();
   const rootPattern = /\/(?:_next\/static|assets|vendor|css|js|img|fonts|static)\/[^\s"'<>),\\]+/g;
   const absolutePattern = new RegExp(`${escapeRegExp(source.origin)}\\/(?:_next\\/static|assets|vendor|css|js|img|fonts|static)\\/[^\\s"'<>),\\\\]+`, "g");
+  const absoluteStaticAssetPattern = /https?:\/\/[^\s"'<>),\\]+\/(?:_next\/static|assets|vendor|css|js|img|fonts|static)\/[^\s"'<>),\\]+/g;
   const rootFilePattern =
     /\/(?:favicon(?:-[^/?#\s"'<>),\\]+)?\.(?:ico|png|svg)|apple-touch-icon\.png|site\.webmanifest|web-app-manifest-\d+x\d+\.png|og\.png)(?:[?#][^\s"'<>),\\]+)?/g;
 
@@ -926,13 +931,17 @@ function extractMirrorAssetUrls(html, sourceUrl) {
   for (const match of html.matchAll(absolutePattern)) {
     urls.add(match[0].replace(/&amp;/g, "&"));
   }
+  for (const match of html.matchAll(absoluteStaticAssetPattern)) {
+    const url = normalizeMirrorDiscoveredUrl(match[0].replace(/&amp;/g, "&"));
+    if (url) urls.add(url);
+  }
   for (const match of html.matchAll(rootFilePattern)) {
     urls.add(new URL(match[0].replace(/&amp;/g, "&"), sourceUrl).href);
   }
   return [...urls].filter((url) => {
     try {
       const parsed = new URL(url);
-      return isMirrorRootPath(parsed.pathname);
+      return isMirrorRootPath(parsed.pathname) || MIRROR_STATIC_ASSET_EXTENSION_PATTERN.test(parsed.pathname);
     } catch {
       return false;
     }
@@ -941,6 +950,9 @@ function extractMirrorAssetUrls(html, sourceUrl) {
 
 function extractRuntimeMirrorAssetUrls(text, sourceUrl) {
   const urls = new Set(extractMirrorAssetUrls(text, sourceUrl));
+  for (const url of extractExternalStaticAssetUrls(text)) {
+    urls.add(url);
+  }
 
   for (const stem of extractRuntimeMirrorAssetStems(text)) {
     for (const pathSuffix of runtimeAssetPathCandidates(stem)) {
@@ -949,6 +961,50 @@ function extractRuntimeMirrorAssetUrls(text, sourceUrl) {
   }
 
   return [...urls];
+}
+
+function extractExternalStaticAssetUrls(text) {
+  const urls = new Set();
+  const patterns = [
+    /https?:\/\/[^\s"'`<>),\\]+/g,
+    /https?:\\\/\\\/[^\s"'`<>),\\]+/g,
+  ];
+
+  for (const pattern of patterns) {
+    for (const match of text.matchAll(pattern)) {
+      const normalized = normalizeMirrorDiscoveredUrl(match[0]);
+      if (!normalized) continue;
+      try {
+        const url = new URL(normalized);
+        if (isExamplePlaceholderUrl(url)) continue;
+        if (MIRROR_STATIC_ASSET_EXTENSION_PATTERN.test(url.pathname)) urls.add(url.href);
+      } catch {}
+    }
+  }
+
+  return [...urls];
+}
+
+function normalizeMirrorDiscoveredUrl(rawUrl) {
+  let value = String(rawUrl || "")
+    .replace(/\\\//g, "/")
+    .replace(/&amp;/g, "&")
+    .replace(/[\\:;"'`,.)\]}]+$/g, "");
+  value = value.replace(/^(https?:\/\/[^/]+)\.\.\.\.(\/)/i, "$1$2");
+
+  try {
+    const url = new URL(value);
+    if (url.hostname.endsWith("....")) {
+      url.hostname = url.hostname.replace(/\.+$/g, "");
+    }
+    return url.href;
+  } catch {
+    return null;
+  }
+}
+
+function isExamplePlaceholderUrl(url) {
+  return /^(?:www\.)?example\.(?:com|org|net)$/i.test(url.hostname);
 }
 
 function extractRuntimeMirrorAssetStems(text) {
@@ -1036,7 +1092,10 @@ async function fetchMirrorAssetBody(url) {
 async function saveMirrorEntryBody(entry, body, state, resourceType, mimeType) {
   if (!body || body.length > MAX_MIRROR_ASSET_BYTES) return;
 
-  const localPath = originalRootAssetLocalPath(entry.url, state.sourceUrl) || `assets/${resourceType}-${shortHash(entry.url)}${extensionFor(entry.url, mimeType)}`;
+  const localPath =
+    originalRootAssetLocalPath(entry.url, state.sourceUrl) ||
+    originalStaticAssetLocalPath(entry.url) ||
+    `assets/${resourceType}-${shortHash(entry.url)}${extensionFor(entry.url, mimeType)}`;
   const assetPath = path.join(state.outDir, localPath);
   await ensureDir(path.dirname(assetPath));
   await fsp.writeFile(assetPath, body);
@@ -1078,12 +1137,65 @@ function normalizedMirrorEntries(state) {
   return [...byUrl.values()].filter((entry) => !entry.localPath || fs.existsSync(path.join(state.outDir, entry.localPath)));
 }
 
+async function ensureMirrorEntryFiles(entries, state) {
+  for (const entry of entries) {
+    if (!entry.localPath) continue;
+    const existingPath = path.join(state.outDir, entry.localPath);
+    if (fs.existsSync(existingPath)) continue;
+
+    const bodyResult = await fetchMirrorAsset(entry.url).catch(() => null);
+    if (!bodyResult || !isUsableMirrorAssetResponse(entry.url, bodyResult.mimeType)) {
+      delete entry.localPath;
+      delete entry.bytes;
+      continue;
+    }
+
+    const resourceType = inferResourceType(entry.url, bodyResult.mimeType);
+    entry.resourceType = resourceType;
+    entry.status = bodyResult.status;
+    entry.mimeType = bodyResult.mimeType;
+    entry.disposition = classifyMirrorDisposition(resourceType, bodyResult.mimeType, entry.url);
+    await saveMirrorEntryBody(entry, bodyResult.body, state, resourceType, bodyResult.mimeType);
+
+    if (!entry.localPath || !fs.existsSync(path.join(state.outDir, entry.localPath))) {
+      delete entry.localPath;
+      delete entry.bytes;
+    }
+  }
+
+  return entries.filter((entry) => !entry.localPath || fs.existsSync(path.join(state.outDir, entry.localPath)));
+}
+
+function buildMirrorUrlMap(entries) {
+  const urlMap = {};
+  for (const entry of entries) {
+    if (!entry.localPath) continue;
+    urlMap[entry.url] = entry.localPath;
+    const normalized = normalizeMirrorDiscoveredUrl(entry.url);
+    if (normalized) urlMap[normalized] = entry.localPath;
+  }
+  return urlMap;
+}
+
 function originalRootAssetLocalPath(inputUrl, sourceUrl) {
   try {
     const input = new URL(inputUrl);
     const source = new URL(sourceUrl);
     if (input.origin !== source.origin) return null;
     if (!isMirrorRootPath(input.pathname)) return null;
+    const decodedPath = decodeURIComponent(input.pathname.replace(/^\/+/, ""));
+    if (!decodedPath || decodedPath.endsWith("/") || !path.posix.basename(decodedPath)) return null;
+    return decodedPath;
+  } catch {
+    return null;
+  }
+}
+
+function originalStaticAssetLocalPath(inputUrl) {
+  try {
+    const input = new URL(inputUrl);
+    if (!MIRROR_STATIC_ASSET_EXTENSION_PATTERN.test(input.pathname)) return null;
+    if (!input.pathname.startsWith("/static/")) return null;
     const decodedPath = decodeURIComponent(input.pathname.replace(/^\/+/, ""));
     if (!decodedPath || decodedPath.endsWith("/") || !path.posix.basename(decodedPath)) return null;
     return decodedPath;
@@ -1102,11 +1214,17 @@ function inferResourceType(url, mimeType) {
   if (mimeType.startsWith("video/") || mimeType.startsWith("audio/")) return "media";
   if (mimeType.includes("css")) return "stylesheet";
   if (mimeType.includes("javascript")) return "script";
-  if (/\.(woff2?|ttf|otf)(?:[?#].*)?$/i.test(pathFromUrl(url))) return "font";
-  if (/\.(png|jpe?g|gif|svg|webp|avif|ico)(?:[?#].*)?$/i.test(pathFromUrl(url))) return "image";
-  if (/\.(mp4|webm|mp3|wav)(?:[?#].*)?$/i.test(pathFromUrl(url))) return "media";
+  if (/\.(woff2?|ttf|otf)$/i.test(pathFromUrl(url))) return "font";
+  if (/\.(png|jpe?g|gif|svg|webp|avif|ico)$/i.test(pathFromUrl(url))) return "image";
+  if (/\.(mp4|webm|mp3|wav)$/i.test(pathFromUrl(url))) return "media";
   if (isWasmAsset(url, mimeType) || isLottieUrl(url)) return "fetch";
   return "fetch";
+}
+
+function isUsableMirrorAssetResponse(url, mimeType) {
+  const pathname = pathFromUrl(url);
+  if (MIRROR_STATIC_ASSET_EXTENSION_PATTERN.test(pathname) && /^text\/html\b/i.test(mimeType)) return false;
+  return true;
 }
 
 function isLottieUrl(url) {
@@ -1152,18 +1270,27 @@ async function rewriteSavedScriptReferences(entries, urlMap, sourceUrl, outDir) 
     .filter((entry) => entry.localPath)
     .flatMap((entry) => {
       const url = new URL(entry.url);
-      if (url.origin !== sourceOrigin) return [];
       const localRootPath = `/${entry.localPath}`;
       const localRootUrl = `${localRootPath}${url.search}${url.hash}`;
-      return [
+      const items = [
         [entry.url, entry.localPath],
-        [`${sourceOrigin}${url.pathname}${url.search}${url.hash}`, localRootUrl],
-        [`${sourceOrigin}${url.pathname}`, localRootPath],
-        [url.pathname, localRootPath],
-        [`${url.pathname}${url.search}${url.hash}`, localRootUrl],
       ];
+      const normalized = normalizeMirrorDiscoveredUrl(entry.url);
+      if (normalized && normalized !== entry.url) {
+        items.push([normalized, entry.localPath]);
+      }
+      if (url.origin === sourceOrigin) {
+        items.push(
+          [`${sourceOrigin}${url.pathname}${url.search}${url.hash}`, localRootUrl],
+          [`${sourceOrigin}${url.pathname}`, localRootPath],
+          [url.pathname, localRootPath],
+          [`${url.pathname}${url.search}${url.hash}`, localRootUrl],
+        );
+      }
+      return items;
     })
     .sort((a, b) => b[0].length - a[0].length);
+  const prefixReplacements = buildScriptPrefixReplacements(entries);
 
   for (const entry of scriptEntries) {
     const scriptPath = path.join(outDir, entry.localPath);
@@ -1176,8 +1303,73 @@ async function rewriteSavedScriptReferences(entries, urlMap, sourceUrl, outDir) 
       js = js.replaceAll(escapeJsonString(from), escapeJsonString(replacement));
     }
 
+    for (const [from, to] of prefixReplacements) {
+      js = js.replaceAll(from, to);
+      js = js.replaceAll(escapeJsonString(from), escapeJsonString(to));
+    }
+
     await fsp.writeFile(scriptPath, js, "utf8");
   }
+}
+
+function buildScriptPrefixReplacements(entries) {
+  const prefixes = new Map();
+  const staticSegments = [
+    "/static/platform/images/home3/",
+    "/static/platform/images/home/V2/",
+    "/static/platform/images/qr-code/",
+    "/static/platform/images/logo/",
+    "/static/platform/images/activity/",
+  ];
+
+  for (const entry of entries) {
+    if (!entry.localPath) continue;
+    const normalized = normalizeMirrorDiscoveredUrl(entry.url);
+    if (!normalized) continue;
+    let url;
+    try {
+      url = new URL(normalized);
+    } catch {
+      continue;
+    }
+    const segment = staticSegments.find((item) => url.pathname.includes(item));
+    if (!segment) continue;
+    const before = `${url.origin}${segment}`;
+    const after = `${preferredStaticLocalDir(entries, url.pathname, entry.localPath)}/`;
+    if (!prefixes.has(before) || after.length < prefixes.get(before).length) {
+      prefixes.set(before, after);
+    }
+  }
+
+  const output = [];
+  for (const [from, to] of prefixes) {
+    output.push([from, to]);
+    output.push([from.replace("https://cdn.bigmodel.cn/", "https://cdn.bigmodel.cn..../"), to]);
+  }
+  return output.sort((a, b) => b[0].length - a[0].length);
+}
+
+function preferredStaticLocalDir(entries, urlPathname, fallbackLocalPath) {
+  const match = entries.find((entry) => {
+    if (!entry.localPath) return false;
+    try {
+      const url = new URL(entry.url);
+      return url.hostname === "cdn.bigmodel.cn" && url.pathname === urlPathname;
+    } catch {
+      return false;
+    }
+  });
+  if (match) return path.posix.dirname(match.localPath);
+
+  const structured = entries.find((entry) => {
+    if (!entry.localPath || entry.localPath.startsWith("assets/")) return false;
+    try {
+      return new URL(entry.url).pathname === urlPathname;
+    } catch {
+      return false;
+    }
+  });
+  return path.posix.dirname(structured?.localPath || fallbackLocalPath);
 }
 
 async function analyzeCapture(captureDir, { write }) {
@@ -1679,6 +1871,9 @@ async function verifyMirrorDirectory(mirrorDir) {
     for (const sourceRef of extractSourceOriginStaticReferences(text, sourceOrigin)) {
       issues.push(`${file} still references source static asset ${sourceRef}`);
     }
+    for (const externalRef of extractUnrewrittenExternalStaticAssetReferences(text, manifest?.resources || [])) {
+      issues.push(`${file} still references external static asset ${externalRef}`);
+    }
     for (const rootRef of extractRootMirrorReferences(text, file)) {
       issues.push(`${file} still references root asset path ${rootRef}`);
     }
@@ -1721,19 +1916,37 @@ function extractSourceOriginStaticReferences(text, sourceOrigin) {
   return [...refs];
 }
 
+function extractUnrewrittenExternalStaticAssetReferences(text, resources) {
+  const refs = new Set();
+  const savedUrls = new Set((Array.isArray(resources) ? resources : []).filter((resource) => resource.localPath).map((resource) => resource.url));
+  for (const url of extractExternalStaticAssetUrls(text)) {
+    if (savedUrls.has(url) || savedUrls.has(normalizeMirrorDiscoveredUrl(url))) continue;
+    refs.add(url.split(/[?#]/)[0]);
+  }
+  return [...refs];
+}
+
 function extractRootMirrorReferences(text, file = "") {
   if (!/\.(html|css)$/i.test(file)) return [];
   const refs = new Set();
   const patterns = [
     /["'(`](\/(?:_next\/static|assets|vendor|css|js|img|fonts|static)\/[^"'()`\s]+)["'()`]/g,
     /url\(\s*["']?(\/(?:_next\/static|assets|vendor|css|js|img|fonts|static)\/[^"')\s]+)["']?\s*\)/g,
+    /\b(?:src|href|poster|content)=["'](\/(?:_next\/static|assets|vendor|css|js|img|fonts|static)\/[^"']+)["']/gi,
   ];
   for (const pattern of patterns) {
     for (const match of text.matchAll(pattern)) {
+      if (isAllowedRootReference(match[1], file)) continue;
       refs.add(match[1].split(/[?#]/)[0]);
     }
   }
   return [...refs];
+}
+
+function isAllowedRootReference(value, file) {
+  const pathname = String(value || "").split(/[?#]/)[0];
+  if (file === "index.html" && /^\/(?:site\.webmanifest|manifest\.json|img\/icons\/)/.test(pathname)) return true;
+  return false;
 }
 
 function extractLocalFileReferences(text, file = "") {

@@ -21,7 +21,7 @@ Important files:
 
 `mirror` is also the default command. Passing only a URL is equivalent to `mirror <url>`.
 
-Mirror recursively scans saved HTML/CSS/JS for root asset paths such as `/_next/static`, `/assets`, `/vendor`, app icons, manifests, Lottie files, WASM, and common runtime effect assets. This is intentional: animations and interaction effects often live in JS chunks or non-image assets.
+Mirror recursively scans saved HTML/CSS/JS for root asset paths such as `/_next/static`, `/assets`, `/vendor`, app icons, manifests, Lottie files, WASM, common runtime effect assets, and hard-coded external CDN static assets. This is intentional: animations, interaction effects, and visible images often live in JS chunks or are built from runtime data rather than appearing in the initial HTML.
 
 ## capture
 

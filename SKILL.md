@@ -85,7 +85,7 @@ For artifact details, read `references/output-protocol.md`. For project adaptati
 ## Implementation Guidance
 
 - Treat source-level mirroring as the primary flow. Do not default back to visual-only reconstruction unless the mirror is blocked.
-- During `mirror`, save page effects and runtime resources, not only visible images: JS chunks, CSS, fonts, videos, audio, Lottie, WASM, manifests, favicon/app icons, and assets referenced inside saved HTML/CSS/JS.
+- During `mirror`, save page effects and runtime resources, not only visible images: JS chunks, CSS, fonts, videos, audio, Lottie, WASM, manifests, favicon/app icons, assets referenced inside saved HTML/CSS/JS, and hard-coded CDN static assets discovered in saved JS bundles.
 - Do not tell the user to judge a SPA mirror by double-clicking `index.html`. Serve it over local HTTP first, then inspect console/network issues separately.
 - After mirroring, always run `verify-mirror` and inspect `mirror-verify.json`; if it reports missing files or source-origin references, fix the mirror or document the blocker.
 - Prefer the target repository's existing framework, components, route structure, styling system, and asset pipeline.
@@ -98,7 +98,7 @@ For artifact details, read `references/output-protocol.md`. For project adaptati
 
 - If Playwright cannot launch Chromium, run `npx playwright install chromium`.
 - If a page requires login or blocks automation, stop and ask for an authorized static export, screenshot set, or accessible staging URL.
-- If stylesheets or scripts reference additional assets, recursively fetch those public same-origin assets when possible.
+- If stylesheets or scripts reference additional assets, recursively fetch those public same-origin assets when possible. Also inspect saved JS bundles for external CDN static image/font/media URLs; many SPAs build visible image URLs at runtime rather than placing them in the initial HTML.
 - If the mirror stays on a loading screen, first run `serve <mirror-dir>` and open the local HTTP URL. If it still loads forever, inspect console/network errors for dynamic chunks, API calls, service-worker assumptions, or blocked third-party runtime scripts.
 - If assets are missing or unauthorized, keep the mirror private, document them in `license-review.md`, and replace those assets before publication.
 
