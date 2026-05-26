@@ -39,11 +39,13 @@ Equivalent explicit command:
 npm run replica -- mirror "https://example.com" --out ./replica-mirrors/example
 ```
 
-4. Open the generated local mirror:
+4. Open the generated local mirror through local HTTP. This matters for Vue/React/Webpack/Vite single-page apps; opening `index.html` directly with `file://` can leave the app stuck on its loading screen because routing, dynamic chunks, service-worker assumptions, or runtime requests do not behave like a web origin.
 
 ```bash
-open ./replica-mirrors/example/index.html
+npm run replica -- serve ./replica-mirrors/example
 ```
+
+Then open the printed `http://127.0.0.1:<port>/` URL.
 
 5. Verify the mirror before considering it done:
 
@@ -70,6 +72,7 @@ npm run replica -- compare "https://example.com" "./replica-mirrors/example/inde
 ## CLI Commands
 
 - `mirror <url>` or `<url>`: Default command. Saves a source-level local mirror with `index.html`, local `assets/*`, `mirror-manifest.json`, `license-review.md`, and `screenshot.png`.
+- `serve <mirror-dir>`: Starts a local HTTP server for reviewing a mirror. Prefer this over opening `index.html` directly, especially for SPAs and pages with dynamic JS chunks.
 - `verify-mirror <mirror-dir>`: Checks that manifest resources exist, local HTML/CSS/JS references resolve, and source-origin references have been rewritten.
 - `capture <url>`: Saves desktop, tablet, and mobile screenshots, HTML snapshots, DOM trees, computed styles, CSS variables, readable CSS rules, DOM asset references, and a network asset manifest.
 - `analyze <capture-dir>`: Creates `design-spec.json` and `design-spec.md` with visual tokens, component candidates, layout regions, and asset replacement notes.
@@ -83,6 +86,7 @@ For artifact details, read `references/output-protocol.md`. For project adaptati
 
 - Treat source-level mirroring as the primary flow. Do not default back to visual-only reconstruction unless the mirror is blocked.
 - During `mirror`, save page effects and runtime resources, not only visible images: JS chunks, CSS, fonts, videos, audio, Lottie, WASM, manifests, favicon/app icons, and assets referenced inside saved HTML/CSS/JS.
+- Do not tell the user to judge a SPA mirror by double-clicking `index.html`. Serve it over local HTTP first, then inspect console/network issues separately.
 - After mirroring, always run `verify-mirror` and inspect `mirror-verify.json`; if it reports missing files or source-origin references, fix the mirror or document the blocker.
 - Prefer the target repository's existing framework, components, route structure, styling system, and asset pipeline.
 - Match layout, spacing, typography, breakpoints, states, and animation timing before cosmetic refactors.
@@ -95,6 +99,7 @@ For artifact details, read `references/output-protocol.md`. For project adaptati
 - If Playwright cannot launch Chromium, run `npx playwright install chromium`.
 - If a page requires login or blocks automation, stop and ask for an authorized static export, screenshot set, or accessible staging URL.
 - If stylesheets or scripts reference additional assets, recursively fetch those public same-origin assets when possible.
+- If the mirror stays on a loading screen, first run `serve <mirror-dir>` and open the local HTTP URL. If it still loads forever, inspect console/network errors for dynamic chunks, API calls, service-worker assumptions, or blocked third-party runtime scripts.
 - If assets are missing or unauthorized, keep the mirror private, document them in `license-review.md`, and replace those assets before publication.
 
 ## Verification

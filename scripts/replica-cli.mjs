@@ -5,6 +5,7 @@ import fsp from "node:fs/promises";
 import path from "node:path";
 import crypto from "node:crypto";
 import { pathToFileURL } from "node:url";
+import http from "node:http";
 import { chromium } from "playwright";
 import pixelmatch from "pixelmatch";
 import { PNG } from "pngjs";
@@ -94,6 +95,7 @@ authorized-ui-replica CLI
 Usage:
   replica-cli <url> [--out <dir>]
   replica-cli mirror <url> [--out <dir>] [--timeout <ms>] [--viewport <name>]
+  replica-cli serve <mirror-dir> [--port <n>] [--host <host>]
   replica-cli verify-mirror <mirror-dir>
   replica-cli capture <url> [--out <dir>] [--save-assets] [--timeout <ms>] [--max-elements <n>]
   replica-cli analyze <capture-dir>
@@ -103,6 +105,7 @@ Usage:
 
 Notes:
   mirror is the default mode and saves a local source-level mirror.
+  Use serve to review SPA mirrors over HTTP; opening index.html with file:// can keep loaders stuck.
   Commands do not bypass login, paywalls, CAPTCHA, or bot protections.
 `;
 
@@ -134,6 +137,11 @@ async function main() {
 
   if (command === "verify-mirror") {
     await verifyMirrorCommand(positional);
+    return;
+  }
+
+  if (command === "serve") {
+    await serveMirrorCommand(positional, options);
     return;
   }
 
@@ -299,14 +307,20 @@ async function mirrorCommand(positional, options) {
       "This is a source-level mirror for authorized pages.",
       "Verify rights for images, fonts, logos, scripts, stylesheets, and copy before publication.",
       "Dynamic API calls, authentication, service workers, and SPA runtime behavior may still depend on the original site.",
+      "Review the mirror with `replica-cli serve <mirror-dir>` instead of opening index.html directly; file:// can break SPA routing and dynamic chunks.",
     ],
+    localReview: {
+      command: `replica-cli serve ${outDir}`,
+      reason: "Local HTTP review preserves browser behavior expected by most SPA/Webpack/Vite builds.",
+    },
     resources: entries,
   };
   await writeJson(path.join(outDir, "mirror-manifest.json"), manifest);
   await fsp.writeFile(path.join(outDir, "license-review.md"), renderLicenseReview(manifest), "utf8");
 
   console.log(`Mirror written to ${outDir}`);
-  console.log(`Open ${indexPath}`);
+  console.log(`Review over local HTTP: replica-cli serve ${outDir}`);
+  console.log(`Direct file path: ${indexPath}`);
 }
 
 async function verifyMirrorCommand(positional) {
@@ -323,6 +337,101 @@ async function verifyMirrorCommand(positional) {
     return;
   }
   console.log(`Mirror verification passed. Wrote ${reportPath}`);
+}
+
+async function serveMirrorCommand(positional, options) {
+  const mirrorDir = path.resolve(requireArg(positional[0], "mirror-dir"));
+  const stat = await fsp.stat(mirrorDir).catch(() => null);
+  if (!stat?.isDirectory()) {
+    throw new Error(`Mirror directory does not exist: ${mirrorDir}`);
+  }
+  const indexPath = path.join(mirrorDir, "index.html");
+  if (!fs.existsSync(indexPath)) {
+    throw new Error(`Missing index.html in mirror directory: ${mirrorDir}`);
+  }
+
+  const host = typeof options.host === "string" ? options.host : "127.0.0.1";
+  const port = parsePositiveInt(options.port, 4173);
+  const server = http.createServer((req, res) => {
+    serveMirrorRequest(req, res, mirrorDir).catch((error) => {
+      res.writeHead(500, { "content-type": "text/plain; charset=utf-8" });
+      res.end(`Internal server error\n${error.message}\n`);
+    });
+  });
+
+  await new Promise((resolve, reject) => {
+    server.once("error", reject);
+    server.listen(port, host, () => {
+      server.off("error", reject);
+      resolve();
+    });
+  }).catch((error) => {
+    if (error.code === "EADDRINUSE") {
+      throw new Error(`Port ${port} is already in use. Pass --port <n> to use another port.`);
+    }
+    throw error;
+  });
+
+  console.log(`Serving ${mirrorDir}`);
+  console.log(`Open http://${host}:${port}/`);
+  console.log("Press Ctrl+C to stop.");
+
+  await new Promise((resolve) => {
+    const shutdown = () => server.close(resolve);
+    process.once("SIGINT", shutdown);
+    process.once("SIGTERM", shutdown);
+  });
+}
+
+async function serveMirrorRequest(req, res, rootDir) {
+  if (!["GET", "HEAD"].includes(req.method || "GET")) {
+    res.writeHead(405, { allow: "GET, HEAD" });
+    res.end();
+    return;
+  }
+
+  const requestUrl = new URL(req.url || "/", "http://local.mirror");
+  const pathname = decodeURIComponent(requestUrl.pathname);
+  const relative = pathname.replace(/^\/+/, "") || "index.html";
+  let targetPath = path.resolve(rootDir, relative);
+
+  if (!targetPath.startsWith(path.resolve(rootDir))) {
+    res.writeHead(403, { "content-type": "text/plain; charset=utf-8" });
+    res.end("Forbidden\n");
+    return;
+  }
+
+  let stat = await fsp.stat(targetPath).catch(() => null);
+  if (stat?.isDirectory()) {
+    targetPath = path.join(targetPath, "index.html");
+    stat = await fsp.stat(targetPath).catch(() => null);
+  }
+
+  if (!stat?.isFile() && shouldServeSpaFallback(req, pathname)) {
+    targetPath = path.join(rootDir, "index.html");
+    stat = await fsp.stat(targetPath).catch(() => null);
+  }
+
+  if (!stat?.isFile()) {
+    res.writeHead(404, { "content-type": "text/plain; charset=utf-8" });
+    res.end("Not found\n");
+    return;
+  }
+
+  res.writeHead(200, {
+    "content-type": contentTypeFor(targetPath),
+    "cache-control": "no-cache",
+  });
+  if (req.method === "HEAD") {
+    res.end();
+    return;
+  }
+  fs.createReadStream(targetPath).pipe(res);
+}
+
+function shouldServeSpaFallback(req, pathname) {
+  const accept = req.headers.accept || "";
+  return req.method === "GET" && accept.includes("text/html") && !path.extname(pathname);
 }
 
 async function captureCommand(positional, options) {
@@ -1853,6 +1962,35 @@ function extensionFor(input, mimeType) {
   if (mimeType.includes("css")) return ".css";
   if (mimeType.includes("javascript")) return ".js";
   return ".bin";
+}
+
+function contentTypeFor(file) {
+  const ext = path.extname(file).toLowerCase();
+  const types = {
+    ".html": "text/html; charset=utf-8",
+    ".css": "text/css; charset=utf-8",
+    ".js": "text/javascript; charset=utf-8",
+    ".mjs": "text/javascript; charset=utf-8",
+    ".json": "application/json; charset=utf-8",
+    ".svg": "image/svg+xml",
+    ".png": "image/png",
+    ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg",
+    ".gif": "image/gif",
+    ".webp": "image/webp",
+    ".avif": "image/avif",
+    ".ico": "image/x-icon",
+    ".woff": "font/woff",
+    ".woff2": "font/woff2",
+    ".ttf": "font/ttf",
+    ".otf": "font/otf",
+    ".mp4": "video/mp4",
+    ".webm": "video/webm",
+    ".mp3": "audio/mpeg",
+    ".wav": "audio/wav",
+    ".wasm": "application/wasm",
+  };
+  return types[ext] || "application/octet-stream";
 }
 
 async function ensureDir(dir) {
