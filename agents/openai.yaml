@@ -1,0 +1,5 @@
+interface:
+  display_name: "Authorized UI Replica"
+  short_description: "Source-level authorized webpage mirroring"
+  brand_color: "#2563EB"
+  default_prompt: "Use $authorized-ui-replica to mirror an authorized webpage locally, save runtime assets, rewrite resource URLs, and verify the mirror."

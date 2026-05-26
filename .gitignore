@@ -1,0 +1,8 @@
+node_modules/
+replica-captures/
+replica-comparisons/
+replica-mirrors/
+replica-packages/
+output/
+.DS_Store
+npm-debug.log*

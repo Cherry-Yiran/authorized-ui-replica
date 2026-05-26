@@ -1,0 +1,22 @@
+{
+  "name": "authorized-ui-replica-skill",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Codex skill and CLI for authorized source-level webpage mirroring.",
+  "bin": {
+    "replica-cli": "./scripts/replica-cli.mjs"
+  },
+  "scripts": {
+    "replica": "node ./scripts/replica-cli.mjs",
+    "check": "node --check ./scripts/replica-cli.mjs"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "pixelmatch": "^7.2.0",
+    "playwright": "^1.60.0",
+    "pngjs": "^7.0.0"
+  }
+}
